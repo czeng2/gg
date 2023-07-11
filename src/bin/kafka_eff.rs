@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use maelstrom::kv::{lin_kv, Storage, KV};
 use maelstrom::protocol::{Message, MessageBody};
 use maelstrom::{done, Node, Result, Runtime};
-use serde_json::Value;
-use std::sync::Arc;
+use serde_json::{Value, Map, json};
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use tokio::time::Duration;
 use tokio_context::context::Context;
 
@@ -17,7 +18,9 @@ async fn try_main() -> Result<()> {
 }
 
 #[derive(Default)]
-struct Handler {}
+struct Handler {
+    seen_messages: Mutex<HashMap<String, Vec<(i64, Value)>>>,
+}
 
 async fn get_next_offset(kvstore: &Storage, key: String) -> Result<i64> {
     let (ctx, _handle) = Context::with_timeout(Duration::from_millis(250));
@@ -69,10 +72,17 @@ impl Handler {
                 .insert("offset".into(), our_offset.into());
             runtime.reply(req.clone(), forward_body).await?;
 
-            let (ctx, _handle) = Context::with_timeout(Duration::from_millis(250));
+            self.seen_messages
+                .lock()
+                .expect("could not lock")
+                .entry(key)
+                .or_default()
+                .push((our_offset, msg));
 
-            let msg_key = key_offset(&key, our_offset);
-            kvstore.put(ctx, msg_key, msg).await?;
+            let (ctx, _handle) = Context::with_timeout(Duration::from_millis(250));
+            let kv_key = runtime.node_id();
+            let msgs = self.seen_messages.lock().unwrap().clone();
+            kvstore.put(ctx, kv_key.to_string(), msgs).await?;
 
             return Ok(());
         } else if req.get_type() == "poll" {
@@ -82,21 +92,44 @@ impl Handler {
             //  - else: return empty list
             // respond with that entire map
 
-            let mut map = serde_json::Map::new();
+            let mut all_messages = HashMap::<String, Vec<(i64, Value)>>::new();
+            for node_id in runtime.nodes() {
+                let (ctx, _handle) = Context::with_timeout(Duration::from_millis(250));
+                let node_messages_result = kvstore.get(ctx, node_id.to_string()).await;
+                if !is_maelstrom_error(&node_messages_result, maelstrom::Error::KeyDoesNotExist) {
+                    let node_messages: Value = node_messages_result?;
+                    for (key, msg_list) in node_messages.as_object().unwrap() {
+                        let msg_list = msg_list.as_array().unwrap().iter().map(|pair| {
+                            let pair = pair.as_array().unwrap();
+                            let offset = pair[0].as_i64().unwrap();
+                            (offset, pair[1].clone())
+                        });
+                        all_messages.entry(key.clone()).or_default().extend(msg_list);
+                    }
+                }
+            }
+            
+            let mut map = Map::new();
 
             for (key, offset) in req.body.extra["offsets"].as_object().unwrap().iter() {
-                let kv_key = key_offset(key, offset.as_i64().unwrap());
-                let (ctx, _handle) = Context::with_timeout(Duration::from_millis(250));
-                let list_result = kvstore.get::<Value>(ctx, kv_key).await;
-                let list = if is_maelstrom_error(&list_result, maelstrom::Error::KeyDoesNotExist) {
-                    vec![]
-                } else {
-                    let message = list_result?;
-                    let pair: Value = vec![offset.clone(), message.clone()].into();
-                    vec![pair]
-                };
-
-                map.insert(key.clone(), list.into());
+                let mut key_list = vec![];
+                if let Some(key_messages) = all_messages.get_mut(key) {
+                    key_messages.sort_unstable_by_key(|(offset, _)| *offset);
+                    // find the offset within the list
+                    let mut prev = -1;
+                    for (key_offset, msg) in key_messages {
+                        if *key_offset != prev + 1 {
+                            break;
+                        }
+                        if *key_offset >= offset.as_i64().unwrap() {
+                            key_list.push(json!([key_offset, msg]));
+                        }
+                        prev = *key_offset;
+                    }
+                    // let pair: Value = vec![offset.clone(), message.clone()].into();
+                    // vec![pair]
+                }
+                map.insert(key.clone(), key_list.into());
             }
 
             let mut body = MessageBody::new().with_type("poll_ok");
@@ -173,6 +206,3 @@ fn commit_key(key: &str) -> String {
     format!("commit:{}", key)
 }
 
-fn key_offset(key: &str, offset: i64) -> String {
-    format!("key:{} offset:{}", key, offset)
-}
