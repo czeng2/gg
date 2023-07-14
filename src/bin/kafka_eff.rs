@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use maelstrom::kv::{lin_kv, Storage, KV};
 use maelstrom::protocol::{Message, MessageBody};
 use maelstrom::{done, Node, Result, Runtime};
-use serde_json::{Value, Map, json};
-use std::sync::{Arc, Mutex};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 use tokio_context::context::Context;
 
@@ -59,7 +59,10 @@ impl Handler {
                 if let Ok(offset) = offset_response {
                     break offset;
                 }
-                assert!(is_maelstrom_error(&offset_response, maelstrom::Error::PreconditionFailed));
+                assert!(is_maelstrom_error(
+                    &offset_response,
+                    maelstrom::Error::PreconditionFailed
+                ));
                 loop_count += 1;
             };
             if loop_count > 0 {
@@ -104,11 +107,14 @@ impl Handler {
                             let offset = pair[0].as_i64().unwrap();
                             (offset, pair[1].clone())
                         });
-                        all_messages.entry(key.clone()).or_default().extend(msg_list);
+                        all_messages
+                            .entry(key.clone())
+                            .or_default()
+                            .extend(msg_list);
                     }
                 }
             }
-            
+
             let mut map = Map::new();
 
             for (key, offset) in req.body.extra["offsets"].as_object().unwrap().iter() {
@@ -205,4 +211,3 @@ fn is_maelstrom_error<T>(result: &Result<T>, err_type: maelstrom::Error) -> bool
 fn commit_key(key: &str) -> String {
     format!("commit:{}", key)
 }
-
